@@ -1,0 +1,783 @@
+"""
+Colorado SNOTEL daily WTEQ comparison script using the USDA NRCS AWDB REST API.
+
+What this script does
+---------------------
+1. Pulls active Colorado SNOTEL/SNTLT station metadata that support DAILY WTEQ.
+2. Pulls DAILY WTEQ for selected comparison years over a fixed seasonal window.
+3. Builds:
+   - long daily dataset
+   - station-level seasonal summary for each year
+   - statewide daily series for each year
+   - year-level metrics using all available stations
+   - year-level metrics using only common stations present in all selected years
+   - optional stricter complete-coverage subset
+   - station-by-year pivot tables for melt rate, percent loss, and peak date
+4. Writes all outputs to CSV.
+
+Recommended use
+---------------
+Start with targeted years of interest rather than full POR.
+For your current use case, the selected years are:
+    1981, 2002, 2012, 2015, 2017, 2018
+
+Notes
+-----
+- Comparing "all available sites" across years is informative but not fully apples-to-apples
+  because the network changes over time.
+- The "common station" subset is the defensible interyear comparison.
+- 1981 may yield a much smaller common subset because many current stations did not exist then.
+- If the common subset becomes too small, do not oversell it as statewide.
+"""
+
+from __future__ import annotations
+
+import sys
+import time
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional
+
+import pandas as pd
+import requests
+
+
+# =========================
+# User settings
+# =========================
+
+BASE_URL = "https://wcc.sc.egov.usda.gov/awdbRestApi"
+
+OUTPUT_DIR = Path("awdb_outputs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+COMPARISON_YEARS = [1981, 2002, 2012, 2015, 2017, 2018]
+
+# Seasonal comparison window
+BEGIN_MM_DD = "02-01"
+END_MM_DD = "04-01"
+
+# API chunk size for stationTriplets in /data requests.
+# Keep modest to avoid request-size or timeout issues.
+CHUNK_SIZE = 20
+
+# Retry settings
+MAX_RETRIES = 3
+RETRY_SLEEP_SECONDS = 2.0
+
+# If True, also build stricter complete-coverage subset.
+BUILD_COMPLETE_COVERAGE_SUBSET = True
+
+# If True, return suspect data instead of filtering it out.
+RETURN_SUSPECT_DATA = False
+
+# If True, print additional diagnostics.
+VERBOSE = True
+
+
+# =========================
+# Utility helpers
+# =========================
+
+def log(msg: str) -> None:
+    if VERBOSE:
+        print(msg)
+
+
+def chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
+    return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+
+def request_json(
+    url: str,
+    params: Dict[str, Any],
+    timeout: int = 120,
+    max_retries: int = MAX_RETRIES,
+) -> Any:
+    """
+    GET a JSON endpoint with basic retry logic.
+    Raises requests.HTTPError on final failure.
+    """
+    last_err: Optional[Exception] = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            r = requests.get(url, params=params, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            if attempt < max_retries:
+                log(f"Request failed (attempt {attempt}/{max_retries}). Retrying in {RETRY_SLEEP_SECONDS}s...")
+                time.sleep(RETRY_SLEEP_SECONDS)
+            else:
+                break
+
+    raise RuntimeError(f"Request failed after {max_retries} attempts.\nURL: {url}\nParams: {params}\nError: {last_err}")
+
+
+def safe_mean_nonzero(x: pd.Series) -> Optional[float]:
+    nz = x[pd.to_numeric(x, errors="coerce") > 0]
+    if nz.empty:
+        return None
+    return float(pd.to_numeric(nz, errors="coerce").mean())
+
+
+def ensure_datetime_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
+    if col in df.columns:
+        df[col] = pd.to_datetime(df[col], errors="coerce")
+    return df
+
+
+def write_csv(df: pd.DataFrame, filename: str) -> None:
+    path = OUTPUT_DIR / filename
+    df.to_csv(path, index=False)
+    log(f"Wrote: {path}")
+
+
+# =========================
+# Station metadata pull
+# =========================
+
+def get_co_snotel_stations() -> pd.DataFrame:
+    """
+    Pull active Colorado SNOTEL/SNTLT stations that support DAILY WTEQ.
+    """
+    url = f"{BASE_URL}/services/v1/stations"
+    params = {
+        "stationTriplets": "*:CO:SNTL,*:CO:SNTLT",
+        "elements": "WTEQ",
+        "durations": "DAILY",
+        "returnStationElements": "false",
+        "activeOnly": "true",
+    }
+
+    payload = request_json(url, params, timeout=120)
+
+    rows: List[Dict[str, Any]] = []
+    for s in payload:
+        rows.append(
+            {
+                "stationTriplet": s.get("stationTriplet"),
+                "stationId": s.get("stationId"),
+                "stateCode": s.get("stateCode"),
+                "networkCode": s.get("networkCode"),
+                "name": s.get("name"),
+                "dcoCode": s.get("dcoCode"),
+                "countyName": s.get("countyName"),
+                "huc": s.get("huc"),
+                "elevation_ft": s.get("elevation"),
+                "latitude": s.get("latitude"),
+                "longitude": s.get("longitude"),
+                "dataTimeZone": s.get("dataTimeZone"),
+                "operator": s.get("operator"),
+                "stationBeginDate": s.get("beginDate"),
+                "stationEndDate": s.get("endDate"),
+            }
+        )
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df = df.dropna(subset=["stationTriplet"]).sort_values(["name", "stationTriplet"]).reset_index(drop=True)
+    return df
+
+
+# =========================
+# Daily WTEQ pull
+# =========================
+
+def get_daily_wteq(
+    station_triplets: List[str],
+    begin_date: str,
+    end_date: str,
+    chunk_size: int = CHUNK_SIZE,
+    return_suspect_data: bool = RETURN_SUSPECT_DATA,
+) -> pd.DataFrame:
+    """
+    Pull DAILY WTEQ for a list of station triplets over a given date window.
+
+    Returns a long DataFrame with columns such as:
+        stationTriplet, elementCode, durationName, date, value, qcFlag, qaFlag
+    """
+    url = f"{BASE_URL}/services/v1/data"
+    all_rows: List[Dict[str, Any]] = []
+
+    triplet_chunks = chunk_list(station_triplets, chunk_size)
+    total_chunks = len(triplet_chunks)
+
+    for i, chunk in enumerate(triplet_chunks, start=1):
+        log(f"  Pulling chunk {i}/{total_chunks} for {begin_date} to {end_date} ...")
+
+        params = {
+            "stationTriplets": ",".join(chunk),
+            "elements": "WTEQ",
+            "duration": "DAILY",
+            "beginDate": begin_date,
+            "endDate": end_date,
+            "periodRef": "END",
+            "centralTendencyType": "NONE",
+            "returnFlags": "false",
+            "returnOriginalValues": "false",
+            "returnSuspectData": str(return_suspect_data).lower(),
+        }
+
+        payload = request_json(url, params, timeout=180)
+
+        for station in payload:
+            station_triplet = station.get("stationTriplet")
+            for block in station.get("data", []):
+                station_element = block.get("stationElement", {})
+                values = block.get("values", [])
+
+                for v in values:
+                    all_rows.append(
+                        {
+                            "stationTriplet": station_triplet,
+                            "elementCode": station_element.get("elementCode"),
+                            "durationName": station_element.get("durationName"),
+                            "dataPrecision": station_element.get("dataPrecision"),
+                            "storedUnitCode": station_element.get("storedUnitCode"),
+                            "originalUnitCode": station_element.get("originalUnitCode"),
+                            "elementBeginDate": station_element.get("beginDate"),
+                            "elementEndDate": station_element.get("endDate"),
+                            "derivedData": station_element.get("derivedData"),
+                            "date": v.get("date"),
+                            "value": v.get("value"),
+                            "qcFlag": v.get("qcFlag"),
+                            "qaFlag": v.get("qaFlag"),
+                            "origValue": v.get("origValue"),
+                            "origQcFlag": v.get("origQcFlag"),
+                            "average": v.get("average"),
+                            "median": v.get("median"),
+                        }
+                    )
+
+    df = pd.DataFrame(all_rows)
+    if df.empty:
+        return df
+
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df["value"] = pd.to_numeric(df["value"], errors="coerce")
+    df["average"] = pd.to_numeric(df["average"], errors="coerce")
+    df["median"] = pd.to_numeric(df["median"], errors="coerce")
+
+    df = df.sort_values(["stationTriplet", "date"]).reset_index(drop=True)
+    return df
+
+
+# =========================
+# Seasonal summaries
+# =========================
+
+def summarize_current_season(wteq_df: pd.DataFrame, stations_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute station-level metrics for the requested seasonal window.
+
+    Metrics:
+        peak_swe
+        peak_date
+        current_swe
+        current_date
+        net_loss
+        pct_loss
+        days_since_peak
+        melt_rate_in_per_day
+
+    Notes:
+    - peak_date is the first occurrence of the max value in the requested window.
+    - current_swe is the last non-null value in the window.
+    """
+    if wteq_df.empty:
+        return pd.DataFrame()
+
+    summaries: List[Dict[str, Any]] = []
+
+    for station_triplet, g in wteq_df.groupby("stationTriplet"):
+        g = g.dropna(subset=["value"]).sort_values("date").copy()
+        if g.empty:
+            continue
+
+        peak_idx = g["value"].idxmax()
+        peak_row = g.loc[peak_idx]
+        current_row = g.iloc[-1]
+
+        peak_swe = float(peak_row["value"])
+        peak_date = pd.to_datetime(peak_row["date"])
+        current_swe = float(current_row["value"])
+        current_date = pd.to_datetime(current_row["date"])
+
+        net_loss = peak_swe - current_swe
+        pct_loss = net_loss / peak_swe if peak_swe > 0 else None
+        days_since_peak = int((current_date - peak_date).days)
+        melt_rate = net_loss / days_since_peak if days_since_peak > 0 else None
+
+        summaries.append(
+            {
+                "stationTriplet": station_triplet,
+                "peak_swe": peak_swe,
+                "peak_date": peak_date,
+                "current_swe": current_swe,
+                "current_date": current_date,
+                "net_loss": net_loss,
+                "pct_loss": pct_loss,
+                "days_since_peak": days_since_peak,
+                "melt_rate_in_per_day": melt_rate,
+            }
+        )
+
+    summary_df = pd.DataFrame(summaries)
+    if summary_df.empty:
+        return summary_df
+
+    out = summary_df.merge(
+        stations_df[
+            [
+                "stationTriplet",
+                "name",
+                "networkCode",
+                "elevation_ft",
+                "latitude",
+                "longitude",
+                "countyName",
+                "huc",
+            ]
+        ],
+        on="stationTriplet",
+        how="left",
+    )
+
+    return out.sort_values(["melt_rate_in_per_day", "pct_loss"], ascending=[False, False]).reset_index(drop=True)
+
+
+def statewide_daily_series(wteq_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build statewide daily series from long WTEQ data.
+
+    Outputs:
+        date
+        mean_swe
+        median_swe
+        mean_nonzero_swe
+        zero_sites
+        total_sites
+        daily_change_mean_swe
+        daily_change_mean_nonzero_swe
+    """
+    if wteq_df.empty:
+        return pd.DataFrame()
+
+    daily = (
+        wteq_df.groupby("date")["value"]
+        .agg(
+            mean_swe="mean",
+            median_swe="median",
+            zero_sites=lambda x: int((pd.to_numeric(x, errors="coerce") == 0).sum()),
+            total_sites="count",
+        )
+        .reset_index()
+    )
+
+    nonzero = (
+        wteq_df.groupby("date")["value"]
+        .apply(safe_mean_nonzero)
+        .reset_index(name="mean_nonzero_swe")
+    )
+
+    daily = daily.merge(nonzero, on="date", how="left")
+    daily = daily.sort_values("date").reset_index(drop=True)
+    daily["daily_change_mean_swe"] = daily["mean_swe"].diff()
+    daily["daily_change_mean_nonzero_swe"] = daily["mean_nonzero_swe"].diff()
+
+    return daily
+
+
+# =========================
+# Multi-year wrapper
+# =========================
+
+def get_year_window_summary(
+    year: int,
+    stations_df: pd.DataFrame,
+    begin_mm_dd: str = BEGIN_MM_DD,
+    end_mm_dd: str = END_MM_DD,
+    chunk_size: int = CHUNK_SIZE,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Pull one seasonal window for one year and return:
+        daily_long
+        summary
+        statewide
+    """
+    begin_date = f"{year}-{begin_mm_dd}"
+    end_date = f"{year}-{end_mm_dd}"
+
+    log(f"\nRunning year {year}: {begin_date} to {end_date}")
+
+    wteq_df = get_daily_wteq(
+        station_triplets=stations_df["stationTriplet"].tolist(),
+        begin_date=begin_date,
+        end_date=end_date,
+        chunk_size=chunk_size,
+    )
+
+    summary_df = summarize_current_season(wteq_df, stations_df)
+    statewide_df = statewide_daily_series(wteq_df)
+
+    if not wteq_df.empty:
+        wteq_df["year"] = year
+    if not summary_df.empty:
+        summary_df["year"] = year
+    if not statewide_df.empty:
+        statewide_df["year"] = year
+
+    return {
+        "daily_long": wteq_df,
+        "summary": summary_df,
+        "statewide": statewide_df,
+    }
+
+
+def run_comparison_years(
+    years: List[int],
+    begin_mm_dd: str = BEGIN_MM_DD,
+    end_mm_dd: str = END_MM_DD,
+    chunk_size: int = CHUNK_SIZE,
+) -> Dict[str, pd.DataFrame]:
+    """
+    Run selected seasonal window for multiple years.
+
+    Returns:
+        stations
+        daily_long
+        summary
+        statewide
+        metrics
+    """
+    stations_df = get_co_snotel_stations()
+    if stations_df.empty:
+        raise RuntimeError("No Colorado SNOTEL/SNTLT stations were returned by the metadata call.")
+
+    log(f"\nColorado stations found: {len(stations_df)}")
+
+    all_daily: List[pd.DataFrame] = []
+    all_summary: List[pd.DataFrame] = []
+    all_statewide: List[pd.DataFrame] = []
+    metrics_rows: List[Dict[str, Any]] = []
+
+    for year in years:
+        result = get_year_window_summary(
+            year=year,
+            stations_df=stations_df,
+            begin_mm_dd=begin_mm_dd,
+            end_mm_dd=end_mm_dd,
+            chunk_size=chunk_size,
+        )
+
+        daily_df = result["daily_long"]
+        summary_df = result["summary"]
+        statewide_df = result["statewide"]
+
+        if not daily_df.empty:
+            all_daily.append(daily_df)
+        if not summary_df.empty:
+            all_summary.append(summary_df)
+        if not statewide_df.empty:
+            all_statewide.append(statewide_df)
+
+        if not summary_df.empty:
+            threshold_date = pd.Timestamp(f"{year}-03-01")
+            metrics_rows.append(
+                {
+                    "year": year,
+                    "n_sites": len(summary_df),
+                    "zero_sites": int((summary_df["current_swe"] == 0).sum()),
+                    "pct_zero_sites": float((summary_df["current_swe"] == 0).mean()),
+                    "early_peak_sites": int((summary_df["peak_date"] < threshold_date).sum()),
+                    "pct_early_peak_sites": float((summary_df["peak_date"] < threshold_date).mean()),
+                    "median_peak_swe": float(summary_df["peak_swe"].median()),
+                    "median_current_swe": float(summary_df["current_swe"].median()),
+                    "median_net_loss": float(summary_df["net_loss"].median()),
+                    "median_pct_loss": float(summary_df["pct_loss"].median()),
+                    "median_melt_rate": float(summary_df["melt_rate_in_per_day"].median()),
+                    "mean_melt_rate": float(summary_df["melt_rate_in_per_day"].mean()),
+                }
+            )
+        else:
+            metrics_rows.append(
+                {
+                    "year": year,
+                    "n_sites": 0,
+                    "zero_sites": None,
+                    "pct_zero_sites": None,
+                    "early_peak_sites": None,
+                    "pct_early_peak_sites": None,
+                    "median_peak_swe": None,
+                    "median_current_swe": None,
+                    "median_net_loss": None,
+                    "median_pct_loss": None,
+                    "median_melt_rate": None,
+                    "mean_melt_rate": None,
+                }
+            )
+
+    combined_daily = pd.concat(all_daily, ignore_index=True) if all_daily else pd.DataFrame()
+    combined_summary = pd.concat(all_summary, ignore_index=True) if all_summary else pd.DataFrame()
+    combined_statewide = pd.concat(all_statewide, ignore_index=True) if all_statewide else pd.DataFrame()
+    metrics_df = pd.DataFrame(metrics_rows).sort_values("year").reset_index(drop=True)
+
+    return {
+        "stations": stations_df,
+        "daily_long": combined_daily,
+        "summary": combined_summary,
+        "statewide": combined_statewide,
+        "metrics": metrics_df,
+    }
+
+
+# =========================
+# Common-station alignment
+# =========================
+
+def get_common_station_subset(summary_df: pd.DataFrame, years: List[int]) -> pd.DataFrame:
+    """
+    Restrict station summaries to stationTriplets present in all selected years.
+    """
+    if summary_df.empty:
+        return pd.DataFrame()
+
+    counts = (
+        summary_df.groupby("stationTriplet")["year"]
+        .nunique()
+        .reset_index(name="n_years")
+    )
+
+    common_triplets = counts.loc[counts["n_years"] == len(years), "stationTriplet"]
+    aligned = summary_df[summary_df["stationTriplet"].isin(common_triplets)].copy()
+
+    return aligned.reset_index(drop=True)
+
+
+def build_common_station_metrics(common_summary_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Build year-level metrics using only common stations present in all selected years.
+    """
+    if common_summary_df.empty:
+        return pd.DataFrame()
+
+    rows: List[Dict[str, Any]] = []
+
+    for year, g in common_summary_df.groupby("year"):
+        threshold_date = pd.Timestamp(f"{year}-03-01")
+        rows.append(
+            {
+                "year": year,
+                "n_common_sites": len(g),
+                "zero_sites": int((g["current_swe"] == 0).sum()),
+                "pct_zero_sites": float((g["current_swe"] == 0).mean()),
+                "early_peak_sites": int((g["peak_date"] < threshold_date).sum()),
+                "pct_early_peak_sites": float((g["peak_date"] < threshold_date).mean()),
+                "median_peak_swe": float(g["peak_swe"].median()),
+                "median_current_swe": float(g["current_swe"].median()),
+                "median_net_loss": float(g["net_loss"].median()),
+                "median_pct_loss": float(g["pct_loss"].median()),
+                "median_melt_rate": float(g["melt_rate_in_per_day"].median()),
+                "mean_melt_rate": float(g["melt_rate_in_per_day"].mean()),
+            }
+        )
+
+    return pd.DataFrame(rows).sort_values("year").reset_index(drop=True)
+
+
+# =========================
+# Complete coverage subset
+# =========================
+
+def get_complete_coverage_subset(
+    daily_df: pd.DataFrame,
+    years: List[int],
+    begin_mm_dd: str,
+    end_mm_dd: str,
+) -> pd.DataFrame:
+    """
+    Restrict daily data to stationTriplets with complete daily coverage in the target window
+    for every selected year.
+
+    This is stricter than common-station presence because it requires all days in-window.
+    """
+    if daily_df.empty:
+        return pd.DataFrame()
+
+    expected_counts: Dict[int, int] = {}
+    for year in years:
+        start = pd.Timestamp(f"{year}-{begin_mm_dd}")
+        end = pd.Timestamp(f"{year}-{end_mm_dd}")
+        expected_counts[year] = len(pd.date_range(start, end, freq="D"))
+
+    counts = (
+        daily_df.groupby(["stationTriplet", "year"])["date"]
+        .nunique()
+        .reset_index(name="n_days")
+    )
+
+    counts["expected_days"] = counts["year"].map(expected_counts)
+    counts["is_complete"] = counts["n_days"] == counts["expected_days"]
+
+    complete_station_years = counts[counts["is_complete"]].copy()
+
+    complete_counts = (
+        complete_station_years.groupby("stationTriplet")["year"]
+        .nunique()
+        .reset_index(name="n_years_complete")
+    )
+
+    valid_triplets = complete_counts.loc[
+        complete_counts["n_years_complete"] == len(years), "stationTriplet"
+    ]
+
+    return daily_df[daily_df["stationTriplet"].isin(valid_triplets)].copy().reset_index(drop=True)
+
+
+def summarize_from_daily_subset(
+    daily_subset_df: pd.DataFrame,
+    stations_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Rebuild station-year summary from a restricted daily subset.
+    Expects daily_subset_df to already include a year column.
+    """
+    if daily_subset_df.empty:
+        return pd.DataFrame()
+
+    pieces: List[pd.DataFrame] = []
+    for year, g in daily_subset_df.groupby("year"):
+        s = summarize_current_season(g.drop(columns=["year"]), stations_df)
+        if not s.empty:
+            s["year"] = year
+            pieces.append(s)
+
+    return pd.concat(pieces, ignore_index=True) if pieces else pd.DataFrame()
+
+
+# =========================
+# Pivot builders
+# =========================
+
+def build_station_year_pivot(summary_df: pd.DataFrame, value_col: str) -> pd.DataFrame:
+    """
+    Create station x year pivot table for a chosen summary metric.
+    Examples:
+        value_col = 'melt_rate_in_per_day'
+        value_col = 'pct_loss'
+        value_col = 'peak_date'
+    """
+    if summary_df.empty:
+        return pd.DataFrame()
+
+    pivot = summary_df.pivot_table(
+        index=["stationTriplet", "name", "elevation_ft"],
+        columns="year",
+        values=value_col,
+        aggfunc="first",
+    ).reset_index()
+
+    pivot.columns.name = None
+    return pivot
+
+
+# =========================
+# Main execution
+# =========================
+
+def main() -> None:
+    log("Starting AWDB Colorado WTEQ comparison workflow...")
+
+    results = run_comparison_years(
+        years=COMPARISON_YEARS,
+        begin_mm_dd=BEGIN_MM_DD,
+        end_mm_dd=END_MM_DD,
+        chunk_size=CHUNK_SIZE,
+    )
+
+    stations_df = results["stations"]
+    daily_df = results["daily_long"]
+    summary_df = results["summary"]
+    statewide_df = results["statewide"]
+    metrics_df = results["metrics"]
+
+    # Save core outputs
+    write_csv(stations_df, "co_stations_metadata.csv")
+    write_csv(daily_df, "co_wteq_daily_long_selected_years.csv")
+    write_csv(summary_df, "co_wteq_station_summary_selected_years.csv")
+    write_csv(statewide_df, "co_wteq_statewide_selected_years.csv")
+    write_csv(metrics_df, "co_wteq_year_metrics_all_available_sites.csv")
+
+    print("\n=== All-available-site metrics ===")
+    print(metrics_df.to_string(index=False))
+
+    # Common-station subset
+    common_summary_df = get_common_station_subset(summary_df, COMPARISON_YEARS)
+    common_metrics_df = build_common_station_metrics(common_summary_df)
+
+    write_csv(common_summary_df, "co_wteq_station_summary_common_sites.csv")
+    write_csv(common_metrics_df, "co_wteq_year_metrics_common_sites.csv")
+
+    if not common_metrics_df.empty:
+        print("\n=== Common-station metrics ===")
+        print(common_metrics_df.to_string(index=False))
+    else:
+        print("\nNo common-station subset was available across all selected years.")
+
+    # Pivot outputs from common-station summary
+    melt_pivot_df = build_station_year_pivot(common_summary_df, "melt_rate_in_per_day")
+    pct_loss_pivot_df = build_station_year_pivot(common_summary_df, "pct_loss")
+    peak_date_pivot_df = build_station_year_pivot(common_summary_df, "peak_date")
+
+    write_csv(melt_pivot_df, "co_wteq_melt_rate_common_sites_pivot.csv")
+    write_csv(pct_loss_pivot_df, "co_wteq_pct_loss_common_sites_pivot.csv")
+    write_csv(peak_date_pivot_df, "co_wteq_peak_date_common_sites_pivot.csv")
+
+    # Optional complete-coverage subset
+    if BUILD_COMPLETE_COVERAGE_SUBSET:
+        complete_daily_df = get_complete_coverage_subset(
+            daily_df=daily_df,
+            years=COMPARISON_YEARS,
+            begin_mm_dd=BEGIN_MM_DD,
+            end_mm_dd=END_MM_DD,
+        )
+
+        complete_summary_df = summarize_from_daily_subset(complete_daily_df, stations_df)
+        complete_common_summary_df = get_common_station_subset(complete_summary_df, COMPARISON_YEARS)
+        complete_common_metrics_df = build_common_station_metrics(complete_common_summary_df)
+
+        write_csv(complete_daily_df, "co_wteq_daily_complete_coverage_subset.csv")
+        write_csv(complete_summary_df, "co_wteq_station_summary_complete_coverage_subset.csv")
+        write_csv(complete_common_summary_df, "co_wteq_station_summary_complete_common_sites.csv")
+        write_csv(complete_common_metrics_df, "co_wteq_year_metrics_complete_common_sites.csv")
+
+        if not complete_common_metrics_df.empty:
+            print("\n=== Complete-coverage common-station metrics ===")
+            print(complete_common_metrics_df.to_string(index=False))
+        else:
+            print("\nNo complete-coverage common-site subset was available across all selected years.")
+
+    # Quick diagnostic summaries
+    if not summary_df.empty:
+        print("\n=== Quick diagnostics ===")
+        print(f"Total station-year summaries: {len(summary_df)}")
+        print(f"Unique stationTriplets in all summaries: {summary_df['stationTriplet'].nunique()}")
+        print(f"Selected years: {COMPARISON_YEARS}")
+        print(f"Output folder: {OUTPUT_DIR.resolve()}")
+
+    log("\nDone.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted by user.", file=sys.stderr)
+        sys.exit(1)
+    except Exception as exc:
+        print(f"\nERROR: {exc}", file=sys.stderr)
+        sys.exit(1)
