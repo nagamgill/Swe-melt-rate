@@ -13,13 +13,13 @@ What this script does
    - year-level metrics using only common stations present in all selected years
    - optional stricter complete-coverage subset
    - station-by-year pivot tables for melt rate, percent loss, and peak date
-4. Writes all outputs to CSV.
-
-Recommended use
----------------
-Start with targeted years of interest rather than full POR.
-For your current use case, the selected years are:
-    1981, 2002, 2012, 2015, 2017, 2018
+4. Adds 2026-only full-network diagnostics:
+   - station diagnostics across all available 2026 sites
+   - daily statewide decline metrics
+   - top statewide melt days
+   - top station-level melt events
+   - March-only daily diagnostics
+5. Writes all outputs to CSV.
 
 Notes
 -----
@@ -35,7 +35,7 @@ from __future__ import annotations
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 import pandas as pd
 import requests
@@ -50,14 +50,13 @@ BASE_URL = "https://wcc.sc.egov.usda.gov/awdbRestApi"
 OUTPUT_DIR = Path("awdb_outputs")
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-COMPARISON_YEARS = [1981, 2002, 2012, 2015, 2017, 2018]
+COMPARISON_YEARS = [1981, 2002, 2012, 2015, 2017, 2018, 2026]
 
 # Seasonal comparison window
 BEGIN_MM_DD = "02-01"
 END_MM_DD = "04-01"
 
 # API chunk size for stationTriplets in /data requests.
-# Keep modest to avoid request-size or timeout issues.
 CHUNK_SIZE = 20
 
 # Retry settings
@@ -95,7 +94,7 @@ def request_json(
 ) -> Any:
     """
     GET a JSON endpoint with basic retry logic.
-    Raises requests.HTTPError on final failure.
+    Raises an error on final failure.
     """
     last_err: Optional[Exception] = None
 
@@ -120,12 +119,6 @@ def safe_mean_nonzero(x: pd.Series) -> Optional[float]:
     if nz.empty:
         return None
     return float(pd.to_numeric(nz, errors="coerce").mean())
-
-
-def ensure_datetime_col(df: pd.DataFrame, col: str) -> pd.DataFrame:
-    if col in df.columns:
-        df[col] = pd.to_datetime(df[col], errors="coerce")
-    return df
 
 
 def write_csv(df: pd.DataFrame, filename: str) -> None:
@@ -196,9 +189,6 @@ def get_daily_wteq(
 ) -> pd.DataFrame:
     """
     Pull DAILY WTEQ for a list of station triplets over a given date window.
-
-    Returns a long DataFrame with columns such as:
-        stationTriplet, elementCode, durationName, date, value, qcFlag, qaFlag
     """
     url = f"{BASE_URL}/services/v1/data"
     all_rows: List[Dict[str, Any]] = []
@@ -273,20 +263,6 @@ def get_daily_wteq(
 def summarize_current_season(wteq_df: pd.DataFrame, stations_df: pd.DataFrame) -> pd.DataFrame:
     """
     Compute station-level metrics for the requested seasonal window.
-
-    Metrics:
-        peak_swe
-        peak_date
-        current_swe
-        current_date
-        net_loss
-        pct_loss
-        days_since_peak
-        melt_rate_in_per_day
-
-    Notes:
-    - peak_date is the first occurrence of the max value in the requested window.
-    - current_swe is the last non-null value in the window.
     """
     if wteq_df.empty:
         return pd.DataFrame()
@@ -353,16 +329,6 @@ def summarize_current_season(wteq_df: pd.DataFrame, stations_df: pd.DataFrame) -
 def statewide_daily_series(wteq_df: pd.DataFrame) -> pd.DataFrame:
     """
     Build statewide daily series from long WTEQ data.
-
-    Outputs:
-        date
-        mean_swe
-        median_swe
-        mean_nonzero_swe
-        zero_sites
-        total_sites
-        daily_change_mean_swe
-        daily_change_mean_nonzero_swe
     """
     if wteq_df.empty:
         return pd.DataFrame()
@@ -390,6 +356,123 @@ def statewide_daily_series(wteq_df: pd.DataFrame) -> pd.DataFrame:
     daily["daily_change_mean_nonzero_swe"] = daily["mean_nonzero_swe"].diff()
 
     return daily
+
+
+# =========================
+# 2026 full-network diagnostics
+# =========================
+
+def build_2026_current_year_diagnostics(wteq_df: pd.DataFrame, stations_df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+    """
+    Build current-year diagnostics for the full 2026 network, not just common stations.
+    """
+    if wteq_df.empty:
+        return {
+            "station_diagnostics": pd.DataFrame(),
+            "daily_diagnostics": pd.DataFrame(),
+            "top_statewide_melt_days": pd.DataFrame(),
+            "top_station_melt_events": pd.DataFrame(),
+            "march_daily_diagnostics": pd.DataFrame(),
+        }
+
+    df = wteq_df.copy()
+    df = df.sort_values(["stationTriplet", "date"]).reset_index(drop=True)
+
+    # Station-level daily change
+    df["daily_change"] = df.groupby("stationTriplet")["value"].diff()
+    df["daily_decline"] = df["daily_change"].where(df["daily_change"] < 0, 0.0)
+
+    # Station diagnostics
+    station_rows = []
+    for station_triplet, g in df.groupby("stationTriplet"):
+        g = g.dropna(subset=["value"]).sort_values("date").copy()
+        if g.empty:
+            continue
+
+        peak_idx = g["value"].idxmax()
+        peak_row = g.loc[peak_idx]
+        current_row = g.iloc[-1]
+
+        peak_swe = float(peak_row["value"])
+        peak_date = pd.to_datetime(peak_row["date"])
+        current_swe = float(current_row["value"])
+        current_date = pd.to_datetime(current_row["date"])
+
+        station_rows.append({
+            "stationTriplet": station_triplet,
+            "peak_swe": peak_swe,
+            "peak_date": peak_date,
+            "current_swe": current_swe,
+            "current_date": current_date,
+            "melted_out": current_swe == 0,
+            "peaked": peak_date < current_date,
+            "net_loss": peak_swe - current_swe,
+            "pct_loss": (peak_swe - current_swe) / peak_swe if peak_swe > 0 else None,
+        })
+
+    station_diag = pd.DataFrame(station_rows)
+    station_diag = station_diag.merge(
+        stations_df[["stationTriplet", "name", "elevation_ft", "latitude", "longitude"]],
+        on="stationTriplet",
+        how="left",
+    )
+
+    # Daily diagnostics
+    daily_rows = []
+    for date, g in df.groupby("date"):
+        vals = pd.to_numeric(g["value"], errors="coerce")
+        changes = pd.to_numeric(g["daily_change"], errors="coerce")
+
+        valid_changes = changes.dropna()
+        decline_changes = valid_changes[valid_changes < 0]
+
+        n_sites = int(vals.notna().sum())
+        n_declining = int((valid_changes < 0).sum())
+        n_flat = int((valid_changes == 0).sum())
+        n_gaining = int((valid_changes > 0).sum())
+
+        daily_rows.append({
+            "date": pd.to_datetime(date),
+            "n_sites": n_sites,
+            "n_declining": n_declining,
+            "pct_declining": n_declining / n_sites if n_sites > 0 else None,
+            "n_flat": n_flat,
+            "n_gaining": n_gaining,
+            "median_daily_change": valid_changes.median() if not valid_changes.empty else None,
+            "mean_daily_change": valid_changes.mean() if not valid_changes.empty else None,
+            "median_daily_decline": decline_changes.median() if not decline_changes.empty else None,
+            "mean_daily_decline": decline_changes.mean() if not decline_changes.empty else None,
+            "total_daily_change": valid_changes.sum() if not valid_changes.empty else None,
+        })
+
+    daily_diag = pd.DataFrame(daily_rows).sort_values("date").reset_index(drop=True)
+
+    top_statewide_melt_days = daily_diag.sort_values(
+        ["total_daily_change", "median_daily_change"],
+        ascending=[True, True]
+    ).reset_index(drop=True)
+
+    station_event_df = df.dropna(subset=["daily_change"]).copy()
+    station_event_df = station_event_df[station_event_df["daily_change"] < 0].copy()
+    station_event_df = station_event_df.merge(
+        stations_df[["stationTriplet", "name", "elevation_ft", "latitude", "longitude"]],
+        on="stationTriplet",
+        how="left",
+    )
+    top_station_melt_events = station_event_df.sort_values("daily_change", ascending=True).reset_index(drop=True)
+
+    march_daily_diag = daily_diag[
+        (daily_diag["date"] >= pd.Timestamp("2026-03-01")) &
+        (daily_diag["date"] <= pd.Timestamp("2026-03-31"))
+    ].copy()
+
+    return {
+        "station_diagnostics": station_diag,
+        "daily_diagnostics": daily_diag,
+        "top_statewide_melt_days": top_statewide_melt_days,
+        "top_station_melt_events": top_station_melt_events,
+        "march_daily_diagnostics": march_daily_diag,
+    }
 
 
 # =========================
@@ -446,13 +529,6 @@ def run_comparison_years(
 ) -> Dict[str, pd.DataFrame]:
     """
     Run selected seasonal window for multiple years.
-
-    Returns:
-        stations
-        daily_long
-        summary
-        statewide
-        metrics
     """
     stations_df = get_co_snotel_stations()
     if stations_df.empty:
@@ -602,8 +678,6 @@ def get_complete_coverage_subset(
     """
     Restrict daily data to stationTriplets with complete daily coverage in the target window
     for every selected year.
-
-    This is stricter than common-station presence because it requires all days in-window.
     """
     if daily_df.empty:
         return pd.DataFrame()
@@ -666,10 +740,6 @@ def summarize_from_daily_subset(
 def build_station_year_pivot(summary_df: pd.DataFrame, value_col: str) -> pd.DataFrame:
     """
     Create station x year pivot table for a chosen summary metric.
-    Examples:
-        value_col = 'melt_rate_in_per_day'
-        value_col = 'pct_loss'
-        value_col = 'peak_date'
     """
     if summary_df.empty:
         return pd.DataFrame()
@@ -761,7 +831,43 @@ def main() -> None:
         else:
             print("\nNo complete-coverage common-site subset was available across all selected years.")
 
-    # Quick diagnostic summaries
+    # 2026-only full-network diagnostics
+    current_year_daily = daily_df[daily_df["year"] == 2026].copy()
+
+    if not current_year_daily.empty:
+        current_year_daily_no_year = current_year_daily.drop(columns=["year"])
+        diag_2026 = build_2026_current_year_diagnostics(current_year_daily_no_year, stations_df)
+
+        station_diag_2026 = diag_2026["station_diagnostics"]
+        daily_diag_2026 = diag_2026["daily_diagnostics"]
+        top_statewide_melt_days_2026 = diag_2026["top_statewide_melt_days"]
+        top_station_melt_events_2026 = diag_2026["top_station_melt_events"]
+        march_daily_diag_2026 = diag_2026["march_daily_diagnostics"]
+
+        write_csv(station_diag_2026, "co_2026_station_diagnostics_full_network.csv")
+        write_csv(daily_diag_2026, "co_2026_daily_diagnostics_full_network.csv")
+        write_csv(top_statewide_melt_days_2026.head(25), "co_2026_top_25_statewide_melt_days.csv")
+        write_csv(top_station_melt_events_2026.head(100), "co_2026_top_100_station_melt_events.csv")
+        write_csv(march_daily_diag_2026, "co_2026_march_daily_diagnostics_full_network.csv")
+
+        print("\n=== 2026 full-network diagnostics ===")
+        print(f"Total active sites in 2026 window: {len(station_diag_2026)}")
+        print(f"Sites peaked by latest date: {(station_diag_2026['peaked']).sum()} / {len(station_diag_2026)}")
+        print(f"Sites melted out by latest date: {(station_diag_2026['melted_out']).sum()} / {len(station_diag_2026)}")
+
+        if not daily_diag_2026.empty and not top_statewide_melt_days_2026.empty:
+            top_day = top_statewide_melt_days_2026.iloc[0]
+            print(
+                f"Worst statewide decline day (by total daily change): "
+                f"{top_day['date'].date()} | total_daily_change={top_day['total_daily_change']:.2f} "
+                f"| median_daily_change={top_day['median_daily_change']:.3f}"
+            )
+
+        if not march_daily_diag_2026.empty:
+            print(f"March median of daily median change: {march_daily_diag_2026['median_daily_change'].median():.3f}")
+            print(f"March mean pct of sites declining: {march_daily_diag_2026['pct_declining'].mean():.3%}")
+
+    # Quick diagnostics
     if not summary_df.empty:
         print("\n=== Quick diagnostics ===")
         print(f"Total station-year summaries: {len(summary_df)}")
